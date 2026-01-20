@@ -1,15 +1,21 @@
 import streamlit as st
+import subprocess
 import pandas as pd
 from GoogleNews import GoogleNews
 from datetime import datetime, timedelta
 import time
 import random
-import base64
 
-# --- HELPER FUNCTIONS ---
+def get_git_revision_hash():
+    try:
+        # Runs 'git rev-parse --short HEAD' to get the 7-character hash
+        return subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD']).decode('ascii').strip()
+    except Exception:
+        return "No Git Hash Found"
 
+# --- 1. DATE CALCULATIONS ---
 def get_half_year_intervals(start_str, end_str):
-    """Splits date range into ~6-month chunks."""
+    """Splits the long timeline into 6-month chunks to maximize results."""
     start = datetime.strptime(start_str, "%m/%d/%Y")
     end = datetime.strptime(end_str, "%m/%d/%Y")
     intervals = []
@@ -26,115 +32,103 @@ def get_half_year_intervals(start_str, end_str):
         current = next_chunk + timedelta(days=1)
     return intervals
 
+# --- 2. THE SCRAPER ---
 def scrape_interval(query, start_date, end_date):
-    """Scrapes a single interval."""
-    googlenews = GoogleNews()
-    googlenews.set_lang('en')
-    googlenews.set_time_range(start_date, end_date)
-    googlenews.set_encode('utf-8')
+    """Scrapes multiple pages for a specific window using absolute date parameters."""
+    # We initialize with start/end to force Google's custom range (cdr) parameters
+    googlenews = GoogleNews(lang='en', encode='utf-8', start=start_date, end=end_date)
     
     googlenews.search(query)
-    all_results = googlenews.result()
+    all_raw_results = []
     
-    # Try to get up to 5 pages
-    for i in range(2, 6):
-        try:
-            googlenews.getpage(i)
-            page_results = googlenews.result()
-            if not page_results:
-                break
-            all_results.extend(page_results)
-            time.sleep(random.uniform(1, 3)) # Polite delay
-        except Exception:
-            break
+    # Iterate through pages (Google typically provides up to 10 for news)
+    for i in range(1, 6):
+        googlenews.get_page(i)
+        page_results = googlenews.results()
+        if page_results:
+            all_raw_results.extend(page_results)
+        
+        googlenews.clear() # Clear internal buffer for next page
+        time.sleep(random.uniform(2, 4))
             
-    return all_results
+    return all_raw_results
 
-def clean_data(results_list):
-    """Dedupes and cleans data."""
+# --- 3. DEDUPLICATION & CLEANING ---
+def clean_and_format_data(raw_list, query_text, interval_label):
+    """Processes raw library output into a clean list of dictionaries."""
     cleaned = []
     seen_urls = set()
-    for item in results_list:
-        url = item.get('link', '')
-        if url in seen_urls:
+    
+    for item in raw_list:
+        url = item.get('link')
+        if not url or url in seen_urls:
             continue
+        
         seen_urls.add(url)
         cleaned.append({
-            'headline': item.get('title', ''),
-            'date': item.get('date', ''),
+            'absolute_datetime': item.get('datetime'), # The precision timestamp
+            'headline': item.get('title'),
+            'outlet': item.get('media'),
             'url': url,
-            'description': item.get('desc', '')
+            'description': item.get('desc'),
+            'query_filter': query_text,
+            'time_chunk': interval_label
         })
     return cleaned
 
-# --- STREAMLIT UI ---
+# --- 4. STREAMLIT UI ---
+st.set_page_config(page_title="📰 Historical News Researcher", layout="wide")
+st.title("📰 Historical News Researcher")
 
-st.set_page_config(page_title="Gaza News Scraper", page_icon="📰")
-
-st.title("📰 Historical News Scraper")
-st.markdown("Scrape Google News results by date range and outlet.")
-
-# Sidebar Inputs
-st.sidebar.header("Configuration")
+# Sidebar
+st.sidebar.header("Search Configuration")
 start_input = st.sidebar.text_input("Start Date (MM/DD/YYYY)", "10/07/2023")
 end_input = st.sidebar.text_input("End Date (MM/DD/YYYY)", "01/01/2026")
+query_list = st.sidebar.text_area("Queries", "Gaza site:bbc.com\nGaza site:nytimes.com\nGaza site:foxnews.com")
 
-outlets = st.sidebar.text_area(
-    "Outlets & Queries (One per line)", 
-    "Gaza site:bbc.com\nGaza site:nytimes.com\nGaza site:foxnews.com"
-)
+st.sidebar.markdown(f"**Version (Commit):** `{get_git_revision_hash()}`")
 
-if st.button("Start Scraping"):
-    queries = [q.strip() for q in outlets.split('\n') if q.strip()]
+if st.sidebar.button("Run Full Scrape"):
+    queries = [q.strip() for q in query_list.split('\n') if q.strip()]
     intervals = get_half_year_intervals(start_input, end_input)
     
-    total_steps = len(queries) * len(intervals)
+    master_data = []
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    all_dfs = []
-    step_count = 0
+    total_tasks = len(queries) * len(intervals)
+    current_task = 0
     
-    for query_text in queries:
-        outlet_safe = query_text.replace(' ', '_').replace(':', '').replace('/', '')
-        st.subheader(f"Processing: {query_text}")
-        
+    for q_text in queries:
         for interval in intervals:
-            step_count += 1
-            progress = step_count / total_steps
-            progress_bar.progress(progress)
-            status_text.text(f"Scraping {interval['start']} to {interval['end']}...")
+            current_task += 1
+            status_text.info(f"Task {current_task}/{total_tasks}: {q_text} ({interval['label']})")
             
-            # Scrape
-            raw = scrape_interval(query_text, interval['start'], interval['end'])
-            data = clean_data(raw)
+            # 1. Get raw data from Google
+            raw_results = scrape_interval(q_text, interval['start'], interval['end'])
             
-            if data:
-                df = pd.DataFrame(data)
-                # Add metadata columns
-                df['query'] = query_text
-                df['interval_label'] = interval['label']
-                all_dfs.append(df)
-                st.success(f"  Found {len(df)} articles for {interval['start']} - {interval['end']}")
-            else:
-                st.warning(f"  No results for {interval['start']} - {interval['end']}")
+            # 2. Clean and deduplicate it
+            chunk_data = clean_and_format_data(raw_results, q_text, interval['label'])
             
-            # Sleep to avoid block
-            time.sleep(random.uniform(2, 5))
+            # 3. Add to master list
+            master_data.extend(chunk_data)
+            
+            progress_bar.progress(current_task / total_tasks)
+            time.sleep(random.uniform(3, 5)) # Safety delay
 
-    # Combine all results
-    if all_dfs:
-        final_df = pd.concat(all_dfs, ignore_index=True)
-        st.write("### Preview of Results")
-        st.dataframe(final_df.head())
+    if master_data:
+        df = pd.DataFrame(master_data)
         
-        # Convert to CSV for download
-        csv = final_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download All Data as CSV",
-            data=csv,
-            file_name='scraped_news_data.csv',
-            mime='text/csv',
-        )
+        # Final formatting
+        df['absolute_datetime'] = pd.to_datetime(df['absolute_datetime'], errors='coerce')
+        df = df.sort_values('absolute_datetime', ascending=False)
+        
+        st.success(f"Successfully extracted {len(df)} unique articles!")
+        st.dataframe(df.head(100)) # Show preview
+        
+        # Export
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Precision CSV", csv, "historical_news_export.csv", "text/csv")
     else:
-        st.error("No data found.")
+        st.error("No data found. Check your dates or IP status.")
